@@ -1,4 +1,16 @@
-# Mixtape Bug Hunt — Submission
+# Mixtape Bug Hunt - Submission
+
+## AI Usage
+
+I used Claude (via Cowork) as a pair-programming partner throughout this project, mainly for reading and navigating code I hadn't written, not for generating fixes blind.
+
+**Codebase orientation.** I had Claude read `app.py`, `models.py`, and every file in `routes/` and `services/`, explain what each one does, and trace one full data flow end to end — adding a song to a playlist through to the resulting notification. Before picking which bugs to fix, I also had it read all 5 issue descriptions and skim every affected service file, comparing each function's docstring against its actual implementation. That comparison is what surfaced most of the bugs before I'd even opened an issue: `streak_service.py`'s docstring says nothing about weekdays but the code checks one, and `playlist_service.py`'s docstring literally says "returns all songs in the playlist" right above a line that slices the last one off.
+
+**Root cause tracing.** For each bug, I had Claude walk the exact call path from route → service function, and explain specific things I didn't know off the top of my head — what `datetime.weekday()` returns for each day, and why subtracting a fixed 24-hour `timedelta` isn't the same as comparing calendar dates. For Issue #4, it read `add_to_playlist()` (the working notification path) and `rate_song()` (the broken one) side by side and pointed out that the second function wasn't wrong so much as missing a whole block the first one has.
+
+**Where I had to push back and verify it myself.** Issue #3 is the one that didn't go smoothly. Claude's first attempts to reproduce the duplicate-search-results bug kept coming up with 1 result instead of 3, and its first read was that the bug just wasn't manifesting. I didn't accept that at face value and asked it to dig further before we downgraded or swapped the bug. It came back with a more rigorous case: raw SQL executed outside the ORM showed the join really does return 3 duplicate rows, but the installed SQLAlchemy version quietly collapses them via `Query.all()` before they reach a response — and it reproduced the same collapse on two throwaway, unrelated models to prove it wasn't specific to this app. I still didn't just take that explanation on faith. At every fix, I ran the actual `pytest tests/` suite myself, on my own machine, and the real output matched what Claude predicted each time — including `test_search.py` passing 5/5 even though the code being tested has a proven defect. That's also why Issue #3's RCA entry in this doc reads differently from the other four: it's documented from SQL-level proof, not a reproduced symptom, and I made a point of not letting that difference get glossed over.
+
+**One more thing worth being honest about:** early in Milestone 1, while confirming the app ran, a mismatch between Claude's sandbox and my actual filesystem caused it to accidentally trigger a partial reset against my real local `instance/mixtape.db`. It flagged the problem itself before I noticed anything, and the fix was trivial since `seed_data.py` rebuilds the database from scratch anyway — but it's a real instance of something going wrong mid-session, not just uniformly smooth collaboration.
 
 ## Milestone 1: Codebase Map
 
