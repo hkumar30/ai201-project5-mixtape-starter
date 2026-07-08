@@ -53,7 +53,7 @@ This is the clearest end-to-end flow in the app and a good model for how the res
 - **UUID primary keys everywhere.** Every model uses a string UUID (`generate_uuid()`) as its primary key rather than an auto-incrementing integer.
 - **Association tables carry extra columns when the relationship needs metadata.** `song_tags` and `friendships` are plain many-to-many tables, but `playlist_entries` adds `position`, `added_by`, and `added_at` because playlist membership needs ordering and provenance that a bare join table can't express.
 - **Timestamps are timezone-aware UTC via `lambda: datetime.now(timezone.utc)`** as the column default, consistently across models.
-- **One shared notification constructor.** `create_notification()` is the single write path for the `Notification` table; any code that wants to notify a user is expected to funnel through it rather than constructing a `Notification` directly.
+- **Single write path for notifications.** Anything that wants to notify a user is expected to go through `create_notification()` rather than building a `Notification` object itself.
 
 ## Milestone 1: Environment Setup
 
@@ -62,7 +62,7 @@ Confirmed the app boots and serves real requests from seeded data:
 - `FLASK_APP=app:create_app flask run` served `GET /users/<id>`, `GET /songs/search?q=a`, and `GET /users/<id>/streak`, all returning 200 with expected JSON shapes.
 - Working branch `bugfix/mixtape` already exists and is checked out.
 
-## Milestone 1: Issue Triage (Pre-Milestone 2 Plan)
+## Milestone 1: Issue Triage
 
 All five issue reports (streak reset, stale "listening now" feed, duplicate search results, missing rating notification, missing last playlist song) have been read in full. Based on the affected-service mapping in the README, my working plan is to attempt all five if time allows, prioritizing:
 
@@ -73,3 +73,65 @@ All five issue reports (streak reset, stale "listening now" feed, duplicate sear
 5. Issue #2 (stale listening-now feed) — `feed_service.py` (stretch)
 
 This ordering is provisional and will be finalized in Milestone 2 after reproducing each issue.
+
+---
+
+## Milestone 2: Reproduction
+
+Final set to fix: Issue #1 (streak reset), Issue #3 (search duplicates), Issue #5 (missing last playlist song). Issues #2 and #4 stay on the list as stretch candidates.
+
+A note on environment: pytest wouldn't run in one of the environments I was working in (an unrelated dependency mismatch), so I reproduced each bug first by calling the actual service functions directly and hitting the live seeded app over HTTP. I later ran the real `pytest tests/` suite on my own machine, and that's the output I'd treat as the authoritative check:
+
+```
+tests/test_playlists.py FF.                                                                        [ 23%]
+tests/test_search.py .....                                                                         [ 61%]
+tests/test_streaks.py ....F                                                                        [100%]
+
+FAILED tests/test_playlists.py::test_playlist_returns_all_songs - AssertionError: assert 4 == 5
+FAILED tests/test_playlists.py::test_playlist_returns_songs_in_order - AssertionError: assert [...] == [...]  (missing "Track 5")
+FAILED tests/test_streaks.py::test_streak_increments_on_sunday - assert 1 == 2
+3 failed, 10 passed in 0.52s
+```
+
+Issues #1 and #5 fail exactly as expected. Issue #3 is the interesting one: all 5 `test_search.py` tests pass, including `test_search_no_duplicates_multi_tag_song`. That's not a sandbox quirk — it's my own machine, with the real dependencies, saying the bug doesn't show up anywhere right now.
+
+### Issue #1 — Listening streak keeps resetting (streak_service.py)
+
+**How I reproduced it:** called `update_listening_streak()` directly, the same function `record_listening_event()` calls on every `POST /songs/<id>/listen`, with controlled timestamps mirroring kenji's report: a streak of 12, `last_listened_at` set to a Saturday, then a listen the following Sunday.
+
+```
+Before Sunday listen -> streak = 12
+After Sunday listen  -> streak = 1   (expected 13)
+After Monday listen  -> streak = 2   (expected 14 — matches report: "Monday bumped it to 2")
+```
+
+Matches kenji's report down to the detail that Monday resumes counting from 1 instead of picking the old streak back up. `tests/test_streaks.py::test_streak_increments_on_sunday` fails on this with `assert 1 == 2`, so it's a good candidate for the regression-test stretch goal.
+
+### Issue #3 — Duplicate songs in search (search_service.py)
+
+**How I reproduced it, with a caveat:** I couldn't get duplicate rows to show up in `search_songs()`'s return value or in a live `GET /songs/search?q=Anthem` call, no matter how I approached it. Three checks, same result each time:
+
+1. Called `search_songs("Anthem")` directly against a song with 3 tags (same setup as `tests/test_search.py`'s `song_multi_tags` fixture) — 1 result, not 3.
+2. Hit the live seeded app at `GET /songs/search?q=Anthem` — `{"count":1,...}` for "Crown Heights Anthem," which the real seed data gives 3 tags (rap, hip-hop, boom bap).
+3. Took the exact SQL `search_songs()` generates and ran it two ways in the same session: through the ORM's `.all()` (1 result), and as a raw execute of the identical compiled statement (3 rows). So the join really does fan out to 3 rows at the SQL level — the code has the exact defect the issue describes, an unguarded `outerjoin` with no `.distinct()` — but SQLAlchemy 2.0.51 quietly deduplicates identical entities on `Query.all()` before any of that reaches a response.
+
+To rule out something specific to this app, I tried the same pattern on two throwaway, unrelated models with no relationships at all: `session.query(Parent).join(Child).all()` also collapses to 1 row for a parent with 3 matching children. So this is a real property of the installed SQLAlchemy version, not a fluke of this codebase.
+
+I'm fixing it anyway, defensively — the raw SQL proves the flaw is real even though it's currently masked. One thing worth flagging: `tests/test_search.py::test_search_no_duplicates_multi_tag_song` documents the intended behavior ("Should be 1, bug causes it to be 3"), but per the pytest run above it currently passes. Unlike #1 and #5, I can't point to this test as a regression test that "would have caught the bug," because it doesn't catch it today.
+
+### Issue #5 — Last playlist song never shows up (playlist_service.py)
+
+**How I reproduced it:** checked the seeded "Friday Energy" playlist directly. `playlist_entries` has 7 rows for it (positions 1–7), but `GET /playlists/<id>/songs` returns `count: 6` — the song at position 7 is missing every time.
+
+To confirm the "shift" darius described (adding a new song frees the previously-missing one and hides the new one instead), I inserted a new `playlist_entries` row at position 8 directly, bypassing an unrelated crash in `add_to_playlist()` noted below, and called `get_playlist_songs()` again:
+
+```
+Before: count=6, titles end in [..., "Crown Heights Anthem"]        (position 7 song missing)
+Inserted new song at position 8: "Midnight Drive"
+After:  count=7, titles end in [..., "Crown Heights Anthem", "Harlem Renaissance"]
+        (position 7's "Harlem Renaissance" now shows up; position 8's "Midnight Drive" is missing instead)
+```
+
+Exact match for the report: whatever was added most recently is always the one hidden. `tests/test_playlists.py::test_playlist_returns_all_songs` fails with `assert 4 == 5`, and `test_playlist_returns_songs_in_order` fails too (missing "Track 5") — both good candidates for the regression-test stretch goal.
+
+**Side finding, not one of the 5 issues, not being fixed:** `POST /playlists/<id>/songs` 500s (`IntegrityError: NOT NULL constraint failed: playlist_entries.position`) any time the song being added isn't already in the playlist. `add_to_playlist()` appends to `playlist.songs` through the plain SQLAlchemy `secondary=` relationship, which only populates the two foreign keys — it has no way to fill in the join table's `position` or `added_by` columns, both `NOT NULL` with no default. That's why I reproduced the "add a song" step above with a direct insert instead of the real endpoint. Worth flagging since it's a real, severe bug, just outside the scope of the 5 tracked issues.
