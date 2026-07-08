@@ -318,3 +318,23 @@ Still 13/13 — expected, since none of the existing tests touch `feed_service.p
 +    now = datetime.now(timezone.utc)
 +    cutoff = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
 ```
+
+---
+
+## Regression Test
+
+Added `tests/test_notifications.py`, covering Issue #4 (missing rating notification) — the one bug with zero pre-existing test coverage.
+
+`test_rating_a_friends_song_notifies_the_sharer` seeds a song shared by one user and rated by another, calls `rate_song()`, then asserts the sharer has exactly one notification of type `"song_rated"` mentioning the rater's name and the song's title. Against the pre-fix code, `rate_song()` never called `create_notification()`, so this assertion would fail with `len(notifications) == 0`. I confirmed this directly rather than just asserting it: I checked out the pre-fix version of `notification_service.py` (`git show <fix-commit>^:services/notification_service.py`) into a scratch copy of the app and ran the same scenario against it — it returned 0 notifications, exactly the failure this test is meant to catch. Running the same scenario against the current fixed code returns 1, as expected.
+
+Ran the full suite with the new file included:
+
+```
+tests/test_notifications.py ..                                                 [ 13%]
+tests/test_playlists.py ...                                                    [ 33%]
+tests/test_search.py .....                                                     [ 66%]
+tests/test_streaks.py .....                                                    [100%]
+15 passed in 0.46s
+```
+
+A second test, `test_rating_your_own_song_does_not_notify_yourself`, checks the adjacent case the fix needs to get right without a corresponding bug report: rating your own song shouldn't notify you. This isn't a regression test for a reported bug, but it guards the boundary condition the fix introduces (the `song.shared_by != user_id` guard) so a future change can't silently remove it.
