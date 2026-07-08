@@ -241,3 +241,43 @@ Still 13/13, same as before this fix — expected, since `test_search.py` was pa
 +        .distinct()
          .all()
 ```
+
+---
+
+## Stretch: Bug #4 and Bug #2
+
+### Issue #4 — I got notified when a friend added my song to a playlist but not when they rated it
+
+**How I reproduced it:** Called `rate_song()` directly with a rater who isn't the song's original sharer, then called `get_notifications()` for the sharer. The rating saved correctly (confirmed via the returned `Rating` object and by querying it back), but the sharer's notification list stayed empty. No error, no delay — nothing was ever created, matching aaliya's report exactly.
+
+**How I found the root cause:** `notification_service.py` has two "interact with a friend's shared song" actions: `add_to_playlist()` and `rate_song()`. The module docstring says "Notifications are generated when friends interact with a user's shared songs" — a rating is exactly that kind of interaction. I read `add_to_playlist()` first since it's the one that works: after mutating the playlist, it checks `if song.shared_by != added_by_user_id` and calls `create_notification()` with a type and a formatted body. Then I read `rate_song()` line by line, expecting the same pattern near its own `db.session.commit()`. It wasn't there — the function saves or updates the `Rating` and returns, with no call to `create_notification()` anywhere in it, and no other function calls it on rating's behalf either (I checked by searching the codebase for other callers of `create_notification`; `add_to_playlist()` is the only one). That absence, next to a working sibling function that does the equivalent thing for a different action, is what confirmed this wasn't a subtle logic bug — the notification step for ratings was simply never written.
+
+**The root cause:** `create_notification()` is the single write path for the `Notification` table, and `add_to_playlist()` correctly calls it after a successful playlist add. `rate_song()` performs the equivalent user-facing action (a friend interacting with your shared song) but has no corresponding call to `create_notification()` anywhere in its body. This isn't a comparison or condition that's wrong — there's no notification logic in `rate_song()` at all to be wrong. The fix requires adding a step that was never implemented, not correcting one that misfires.
+
+**My fix and side-effect check:** Added a notification block to `rate_song()`, placed after `db.session.commit()` and structured to match `add_to_playlist()`'s existing pattern exactly: guard on `song.shared_by != user_id` (don't notify yourself), then call `create_notification()` with `notification_type="song_rated"` and a body naming the rater, the song, and the score. Verified three scenarios directly: kenji rating aaliya's song creates exactly one notification for aaliya with the correct text; aaliya rating her own song creates zero notifications (no self-notify); and kenji re-rating the same song a second time creates a second notification rather than silently updating the first. That last behavior mirrors `add_to_playlist()`, which also notifies on every add rather than only the first — I kept the new code consistent with the existing pattern rather than inventing a different dedup rule for ratings. I also confirmed `get_notifications()` and `mark_as_read()` are unaffected, since neither reads or writes anything this change touches.
+
+Ran the real test suite after the fix:
+
+```
+tests/test_playlists.py ...                                                    [ 23%]
+tests/test_search.py .....                                                     [ 61%]
+tests/test_streaks.py .....                                                    [100%]
+13 passed in 0.43s
+```
+
+Still 13/13 — expected, since there's no existing test file for notifications and none of the 13 tests touch `rate_song()` or `notification_service.py` at all. This confirms the change is isolated to the ratings path with no effect on streaks, playlists, or search. See the regression test written for this fix below.
+
+**Diff:**
+```diff
+     db.session.commit()
+ 
++    # Notify the person who originally shared the song (if it wasn't them who rated it)
++    if song.shared_by != user_id:
++        create_notification(
++            user_id=song.shared_by,
++            notification_type="song_rated",
++            body=f"{rater.username} rated your song '{song.title}' {score} stars.",
++        )
++
+     return rating
+```
