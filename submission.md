@@ -135,3 +135,43 @@ After:  count=7, titles end in [..., "Crown Heights Anthem", "Harlem Renaissance
 Exact match for the report: whatever was added most recently is always the one hidden. `tests/test_playlists.py::test_playlist_returns_all_songs` fails with `assert 4 == 5`, and `test_playlist_returns_songs_in_order` fails too (missing "Track 5") — both good candidates for the regression-test stretch goal.
 
 **Side finding, not one of the 5 issues, not being fixed:** `POST /playlists/<id>/songs` 500s (`IntegrityError: NOT NULL constraint failed: playlist_entries.position`) any time the song being added isn't already in the playlist. `add_to_playlist()` appends to `playlist.songs` through the plain SQLAlchemy `secondary=` relationship, which only populates the two foreign keys — it has no way to fill in the join table's `position` or `added_by` columns, both `NOT NULL` with no default. That's why I reproduced the "add a song" step above with a direct insert instead of the real endpoint. Worth flagging since it's a real, severe bug, just outside the scope of the 5 tracked issues.
+
+---
+
+## Milestone 3: Root Cause Analysis
+
+### Issue #1 — My listening streak keeps resetting
+
+**How I reproduced it:** See Milestone 2. Called `update_listening_streak()` directly with a streak of 12 and `last_listened_at` on a Saturday, then updated again with `now` set to the following Sunday. Streak dropped to 1 instead of going to 13.
+
+**How I found the root cause:** Started at the route (`POST /songs/<id>/listen` in `routes/songs.py`), which calls `streak_service.record_listening_event()`. That function does two things: writes a `ListeningEvent`, then calls `update_listening_streak(user, now)` to do the actual streak math. Reading `update_listening_streak()`, its own docstring spells out the rule in plain terms: same day = no change, listened yesterday = increment, more than a day passed = reset to 1. Nothing in that docstring mentions weekdays. Then I read the actual `elif` below it and it didn't match its own docstring:
+
+```python
+elif days_since_last == 1 and today.weekday() != 6:
+    user.listening_streak += 1
+else:
+    user.listening_streak = 1
+```
+
+The mismatch between the documented rule ("listened yesterday increments") and the code (which adds an extra condition not mentioned anywhere) is what told me this was the exact line, not just a suspicious area. I confirmed by checking what `datetime.weekday()` returns for Sunday — 6 — which lines up exactly with kenji's report of it happening only on Sundays.
+
+**The root cause:** `days_since_last == 1` correctly detects "listened yesterday," which should always increment the streak. But the condition has an extra `and today.weekday() != 6` clause tacked on. `weekday()` returns 6 specifically for Sunday, so on any Sunday, this extra clause evaluates to `False`, and the whole `elif` becomes `False` even though the gap really was one day. Execution falls through to the `else` branch, which is meant for "more than one day skipped," and the streak gets reset to 1 — identical to what happens on a real gap. The streak logic has no way to tell "one day passed and today happens to be Sunday" apart from "the user skipped a day," because the Sunday check makes those two cases produce the same branch.
+
+**My fix and side-effect check:** Deleted the `and today.weekday() != 6` clause, restoring the condition to just `elif days_since_last == 1:` — one line changed, matching the function's own docstring exactly. Verified with 6 scenarios directly against `update_listening_streak()`: new user starts at 1, a second listen on the same day doesn't change the streak, Friday→Saturday increments, Saturday→Sunday now increments (the fixed case), Sunday→Monday increments, and — the boundary check that mattered most — a genuine 2-day gap that skips Saturday and lands on Sunday still resets to 1 rather than incrementing. That last case rules out the fix overcorrecting into "every Sunday increments no matter what."
+
+Ran the real test suite after the fix:
+
+```
+tests/test_playlists.py FF.                                                    [ 23%]
+tests/test_search.py .....                                                     [ 61%]
+tests/test_streaks.py .....                                                    [100%]
+2 failed, 11 passed in 0.51s
+```
+
+`test_streaks.py` now passes 5/5, including `test_streak_increments_on_sunday`, which was the one failing before this fix. `test_playlists.py` still fails its same 2 tests and `test_search.py` still passes its same 5 — identical to the Milestone 2 baseline — confirming this change didn't touch playlist or search behavior at all, only the streak boundary it targeted.
+
+**Diff:**
+```diff
+-    elif days_since_last == 1 and today.weekday() != 6:
++    elif days_since_last == 1:
+```
