@@ -208,3 +208,36 @@ All 13 tests pass now. `test_playlists.py` went from 2 failing to 3/3, including
 -    return [song.to_dict() for song in songs[:-1]]
 +    return [song.to_dict() for song in songs]
 ```
+
+### Issue #3 — The same song keeps showing up twice in search
+
+**How I reproduced it:** See Milestone 2, including the caveat. I could not get duplicate rows to appear in `search_songs()`'s output or in a live search request on this machine — three separate checks all came back clean. What I could prove is that the underlying SQL genuinely returns duplicate rows; the installed SQLAlchemy version (2.0.51) just happens to collapse them before they reach a response. I'm documenting this fix based on that SQL-level proof rather than a visible symptom.
+
+**How I found the root cause:** Followed `GET /songs/search?q=...` in `routes/songs.py` to `search_service.search_songs()`. The function builds one query: it joins `Song` to `song_tags` with `outerjoin()`, then filters on title/artist, then calls `.all()`. The join is only there so a song can be matched or displayed alongside its tags, but nothing about the query limits it to one row per song — a `LEFT OUTER JOIN` produces one result row per matching `song_tags` row, so a song with 3 tags contributes 3 rows to the result set, a song with 1 tag contributes 1, and a song with 0 tags contributes 1 (via the outer join's `NULL` match). I confirmed this wasn't just theoretical by pulling the exact compiled SQL out of the query object and running it directly against the database, bypassing the ORM's row processing entirely: for a search matching a 3-tag song, the raw query returned 3 rows for that one song. That's the moment I was confident the defect was real and exactly where the issue description says it is (a join without deduplication), independent of whatever the ORM does with those rows afterward.
+
+**The root cause:** `search_songs()` joins `Song` to `song_tags` to support tag-aware search, but never deduplicates the result by song. Since `song_tags` has one row per `(song_id, tag_id)` pair, `outerjoin(song_tags, ...)` multiplies each matching song by however many tags it has — a song with 3 tags produces 3 joined rows, each of which becomes a candidate entry in the results. The query has no `.distinct()` and no `.group_by(Song.id)`, so nothing collapses those 3 rows back down to 1 song. Whether that shows up as visible duplicates in the JSON response depends on what the ORM layer does with duplicate-PK rows afterward — in my environment, SQLAlchemy 2.0.51's `Query.all()` happens to collapse them, but the query itself doesn't guarantee that, and simone's report shows an environment where it didn't.
+
+**My fix and side-effect check:** Added `.distinct()` to the query, right before `.all()`. One line. This makes deduplication explicit at the SQL level rather than relying on the ORM to paper over it, so the fix holds regardless of SQLAlchemy version. Verified directly: searching "Anthem" against a database with a 3-tag song and a separate 0-tag song that also matches "Anthem" returns exactly 2 results, one per song, not conflated into one and not the 4 raw rows the join alone would produce. I confirmed this at the SQL level too — the raw, non-distinct compiled query for that search returns 4 rows; the same query with `DISTINCT` added returns 2. I also re-checked the single-tag and zero-tag cases to make sure the fix doesn't accidentally under- or over-return: both still return exactly 1 result for their respective songs.
+
+Ran the real test suite after the fix:
+
+```
+tests/test_playlists.py ...                                                    [ 23%]
+tests/test_search.py .....                                                     [ 61%]
+tests/test_streaks.py .....                                                    [100%]
+13 passed in 0.50s
+```
+
+Still 13/13, same as before this fix — expected, since `test_search.py` was passing before for the environment-specific reason explained above, and `.distinct()` doesn't change what it was already asserting. This confirms the fix is a no-op for anything already working (single-tag and zero-tag search, non-tag-related search behavior) while closing the real defect the raw SQL proved.
+
+**Diff:**
+```diff
+         .filter(
+             db.or_(
+                 Song.title.ilike(f"%{query}%"),
+                 Song.artist.ilike(f"%{query}%"),
+             )
+         )
++        .distinct()
+         .all()
+```
