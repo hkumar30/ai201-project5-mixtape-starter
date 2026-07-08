@@ -281,3 +281,40 @@ Still 13/13 — expected, since there's no existing test file for notifications 
 +
      return rating
 ```
+
+### Issue #2 — Friends Listening Now shows people from yesterday
+
+**How I reproduced it:** Computed both cutoffs directly against the real clock rather than the seeded data. With `now` at 2026-07-08T04:46 UTC, a listening event at 2026-07-07T22:00 UTC (10pm "yesterday," 2 hours before midnight) is `>=` the old rolling cutoff (`now - 24h` = 2026-07-07T04:46) — so it would still appear in the feed nearly 5 hours into the next calendar day. That's the exact shape of nova's report: darius's 11pm listen from the previous night still showing up well into the next morning.
+
+**How I found the root cause:** Followed `GET /feed/<user_id>/listening-now` in `routes/feed.py` to `feed_service.get_friends_listening_now()`. The function's own docstring says it returns friends who listened "recently," and nova's report itself frames the expectation as "right now — or at least today." Right above the function, there's a module-level constant: `RECENT_THRESHOLD = timedelta(hours=24)`, used to build `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD`. A fixed 24-hour lookback is a sliding window, not a calendar-day boundary — those are only the same thing if you happen to check at the exact same clock time every day. I compared this to how `streak_service.py` handles the equivalent "is this the same day" question: it calls `.date()` on both timestamps and compares dates directly, never subtracting a fixed duration. That contrast — one file anchors to calendar dates, the other to a rolling duration — is what told me the fix wasn't a wrong number of hours, it was the wrong kind of comparison entirely.
+
+**The root cause:** `get_friends_listening_now()` defines "recent" as "within the last 24 hours of wall-clock time" (`now - timedelta(hours=24)`) instead of "since midnight today." A rolling 24-hour window doesn't reset at midnight — it just slides forward continuously, so anything listened to yesterday evening stays inside the window for the entire following morning and doesn't disappear until exactly 24 hours after it happened, whatever time of day that is. That's why nova saw darius's 11pm listen still present the next morning, and why the report specifically notices it "hangs around... until the same time the next day" — that phrase describes a sliding window exactly, not a calendar-day cutoff.
+
+**My fix and side-effect check:** Replaced the `RECENT_THRESHOLD` constant and the subtraction-based cutoff with a calendar-day boundary: `cutoff = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)`, i.e. midnight UTC today. This mirrors the day-boundary approach `streak_service.py` already uses elsewhere in the codebase rather than introducing a new pattern. Verified the exact boundary directly: the same 10pm-yesterday event that satisfied the old rolling cutoff (`True`) fails the new calendar-day cutoff (`False`) — it's correctly excluded. I also checked the other side of the boundary: an event timestamped one minute after today's midnight is correctly included. I checked `get_activity_feed()` in the same file, since it's the other function here — it doesn't use `cutoff` or `RECENT_THRESHOLD` at all (it's explicitly documented as "not filtered by recency"), so this change has no effect on it.
+
+Ran the real test suite after the fix:
+
+```
+13 passed
+```
+
+Still 13/13 — expected, since none of the existing tests touch `feed_service.py`. Confirms this change is isolated to the feed's recency window.
+
+**Diff:**
+```diff
+-from datetime import datetime, timedelta, timezone
++from datetime import datetime, timezone
+ from sqlalchemy import desc
+ from app import db
+ from models import User, Song, ListeningEvent
+ 
+ 
+-RECENT_THRESHOLD = timedelta(hours=24)
+-
+-
+ def get_friends_listening_now(user_id: str) -> list[dict]:
+     ...
+-    cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD
++    now = datetime.now(timezone.utc)
++    cutoff = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+```
