@@ -175,3 +175,36 @@ tests/test_streaks.py .....                                                    [
 -    elif days_since_last == 1 and today.weekday() != 6:
 +    elif days_since_last == 1:
 ```
+
+### Issue #5 — The last song in a playlist never shows up
+
+**How I reproduced it:** See Milestone 2. The seeded "Friday Energy" playlist has 7 rows in `playlist_entries`, but `GET /playlists/<id>/songs` returns `count: 6`, always missing the highest-position (most recently added) song. Adding another song directly shifted which song was hidden.
+
+**How I found the root cause:** Followed `GET /playlists/<id>/songs` in `routes/playlists.py` to `playlist_service.get_playlist_songs()`. That function queries `Song` joined to `playlist_entries`, filters by playlist, and orders by `position` ascending — all straightforward and correct. Its own docstring even has a line that reads "Note: This function returns all songs in the playlist." Then the return statement didn't match that note:
+
+```python
+return [song.to_dict() for song in songs[:-1]]
+```
+
+`songs` at that point is already the correctly ordered, correctly filtered list — the query itself has no bug. The `[:-1]` slice on the very last line is the only thing removing a song, and it always drops the last element of an ascending-by-position list, which is always the most recently added song. That's what made me confident this was the exact cause rather than something in the query: the query builds the right list, and then one slice throws away its last entry right before returning.
+
+**The root cause:** `get_playlist_songs()` builds the correct, fully ordered list of songs, but returns `songs[:-1]` instead of `songs`. A `[:-1]` slice always drops the last element of whatever list it's given, regardless of how many songs are in the playlist. Since `songs` is sorted ascending by `position`, the last element is always the song with the highest position, i.e. whichever song was added most recently. So the function doesn't just have an off-by-one bug on the count — it structurally always excludes "whatever was added last," which is exactly why darius saw the missing song change identity every time a new one was added.
+
+**My fix and side-effect check:** Removed the `[:-1]` slice, returning `songs` directly. One line changed. Verified with three scenarios directly against `get_playlist_songs()`: an empty playlist still returns `[]`, a single-song playlist now correctly returns that one song (previously the bug returned `[]` here too — a one-song playlist showed zero songs, which is the same defect at its most visible), and a 5-song playlist returns all 5 in order. I also checked whether anything else calls this function: `notification_service.add_to_playlist()` imports `get_playlist_songs` but never actually calls it anywhere in its body, so this fix has no path into the notification flow at all.
+
+Ran the real test suite after the fix:
+
+```
+tests/test_playlists.py ...                                                    [ 23%]
+tests/test_search.py .....                                                     [ 61%]
+tests/test_streaks.py .....                                                    [100%]
+13 passed in 0.44s
+```
+
+All 13 tests pass now. `test_playlists.py` went from 2 failing to 3/3, including the ordering test, and `test_streaks.py`/`test_search.py` are unaffected — everything Issue #1's fix already confirmed is still true, and nothing in playlists broke anything in search or streaks either.
+
+**Diff:**
+```diff
+-    return [song.to_dict() for song in songs[:-1]]
++    return [song.to_dict() for song in songs]
+```
